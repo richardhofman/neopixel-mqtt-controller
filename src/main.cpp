@@ -11,6 +11,9 @@
 #include <settings.h>
 #include <main.h>
 
+#include <map>
+#include <utility>
+
 
 #ifdef __AVR__
   #include <avr/power.h>
@@ -18,6 +21,7 @@
 
 // Globals required for NeoPixel strip control.
 WS2812FX strip = WS2812FX(NUM_PIXELS, PIN, NEO_GRB + NEO_KHZ800);
+bool strip_off = true;
 
 // Globals required for MQTT connectivity.
 WiFiClient mqttClient;
@@ -42,10 +46,8 @@ void setup() {
 
   /* WS2812B stuff */
   strip.init();
-  strip.setBrightness(255);
+  strip.setBrightness(0);
   strip.setSpeed(50);
-  strip.setMode(FX_MODE_RUNNING_LIGHTS);
-  strip.start();
 }
 
 void loop() {
@@ -109,12 +111,17 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   // Extract state information from the parsed JSON.
   uint8_t rgbValues[3];
-  bool powerOn          = root["on"] == 1 ? true : false;
-  uint8_t patternId     = root["pat_id"];
+  bool hasColours = false;
+
+  bool powerOn          = root["state"] == "ON" ? true : false;
+  uint8_t patternId     = pattern_id_from_name((const char*)root["effect"]);
   uint8_t brightness    = root["brightness"];
-  rgbValues[0]          = root["r"];
-  rgbValues[1]          = root["g"];
-  rgbValues[2]          = root["b"];
+  if (root.containsKey("color")) {
+    rgbValues[0]          = root["color"]["r"];
+    rgbValues[1]          = root["color"]["g"];
+    rgbValues[2]          = root["color"]["b"];
+    hasColours = true;
+  }
 
   // Reset the buffer for the next message.
   jsonBuffer.clear();
@@ -122,15 +129,66 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   #ifdef SERIAL_DEBUG
   Serial.println("JSON parse results:");
   Serial.print("On: "); Serial.println(powerOn);
-  Serial.print("Pattern ID: "); Serial.println(patternId);
-  Serial.print("Brightness: "); Serial.println(brightness);
-  Serial.print("R: "); Serial.println(rgbValues[0]);
-  Serial.print("G: "); Serial.println(rgbValues[1]);
-  Serial.print("B: "); Serial.println(rgbValues[2]);
+  if (patternId > 0) Serial.print("Pattern ID: "); Serial.println(patternId);
+  if (brightness > 0) Serial.print("Brightness: "); Serial.println(brightness);
+  if (hasColours) {
+    Serial.print("R: "); Serial.println(rgbValues[0]);
+    Serial.print("G: "); Serial.println(rgbValues[1]);
+    Serial.print("B: "); Serial.println(rgbValues[2]);
+  }
   #endif
 
   // Apply the received state description to the NeoPixel strip.
-  updateLightState(powerOn, patternId, brightness, rgbValues);
+  updateLightState(powerOn, patternId, brightness, rgbValues, hasColours);
+}
+
+uint8_t pattern_id_from_name(const char* effect) {
+  #ifdef SERIAL_DEBUG
+  Serial.print("Received pattern message: ");
+  Serial.println(effect);
+  #endif
+  if (effect == NULL) {
+    #ifdef SERIAL_DEBUG
+    Serial.println("No pattern in message, returning 0.");
+    #endif
+    return 0;
+  } else {
+    // Here comes strcmp... :(
+    if (strcmp_P(effect, "Static") == 0) {
+      return FX_MODE_STATIC;
+    } else if (strcmp_P(effect, "Blink") == 0) {
+      return FX_MODE_BLINK;
+    } else if (strcmp_P(effect, "Breath") == 0) {
+      return FX_MODE_BREATH;
+    } else if (strcmp_P(effect, "Colour Wipe") == 0) {
+      return FX_MODE_COLOR_WIPE;
+    } else if (strcmp_P(effect, "Random Colour") == 0) {
+      return FX_MODE_RANDOM_COLOR;
+    } else if (strcmp_P(effect, "Rainbow Cycle") == 0) {
+      return FX_MODE_RAINBOW_CYCLE;
+    } else if (strcmp_P(effect, "Running Lights") == 0) {
+      return FX_MODE_RUNNING_LIGHTS;
+    } else if (strcmp_P(effect, "Chase Colour") == 0) {
+      return FX_MODE_CHASE_COLOR;
+    } else if (strcmp_P(effect, "Chase Rainbow") == 0) {
+      return FX_MODE_CHASE_RAINBOW;
+    } else if (strcmp_P(effect, "Chase White") == 0) {  
+      return FX_MODE_CHASE_WHITE;
+    } else if (strcmp_P(effect, "Comet") == 0) {
+      return FX_MODE_COMET;
+    } else if (strcmp_P(effect, "Fireworks") == 0) {
+      return FX_MODE_FIREWORKS;
+    } else if (strcmp_P(effect, "Fire Flicker") == 0) {
+      return FX_MODE_FIRE_FLICKER;
+    } else if (strcmp_P(effect, "Fire Flicker Soft") == 0) {
+      return FX_MODE_FIRE_FLICKER_SOFT;
+    } else if (strcmp_P(effect, "Fire Flicker Intense") == 0) {
+      return FX_MODE_FIRE_FLICKER_INTENSE;
+    } else if (strcmp_P(effect, "ICU") == 0) {
+      return FX_MODE_ICU;
+    }
+    return 0;
+  }
 }
 
 /*
@@ -156,23 +214,23 @@ void mqttReconnect() {
 /*
   Updates the physical state of the attached array. Handles trandition animations and steady-state definition.
 */
-void updateLightState(uint8_t command, uint8_t patternId, uint8_t brightness, uint8_t* rgbValues) {
-  return;
-}
-
-/*
-  Custom animation for light strip power off.
-
-  TODO: adjust to work with WS2812FX library.
-  TODO: do something other than a slow fade (boring)
-*/
-void shutdownFade(uint8_t wait) {
-  uint16_t brightness;
-  for (uint16_t i=0; i < strip.numPixels(); i++) {
-    brightness = i > 255 ? 255 : i;
-    strip.setBrightness(brightness);
-    strip.show();
-    delay(wait);
+void updateLightState(bool on, uint8_t patternId, uint8_t brightness, uint8_t* rgbValues, bool updateColours) {
+  if (on) {
+    if (strip_off) {
+      if (updateColours) {
+        startupWipe(10, strip.Color(rgbValues[0], rgbValues[1], rgbValues[2]));
+      } else {
+        startupWipe(10, strip.Color(255, 255, 255));
+      }
+      strip.start();
+      strip_off = false;
+    }
+    if (updateColours) strip.setColor(rgbValues[0], rgbValues[1], rgbValues[2]);
+    if (brightness > 0) strip.setBrightness(brightness);
+    strip.setMode(patternId);
+  } else {
+    strip.stop();
+    strip_off = true;
   }
 }
 
@@ -183,7 +241,7 @@ void shutdownFade(uint8_t wait) {
   TODO: adjust to work with WS2812FX library.
   TODO: adjust to support settling on the starting colour.
 */
-void startupWipe(uint8_t wait) {
+void startupWipe(uint8_t wait, uint32_t colour) {
   uint32_t colours[] = {
     strip.Color(255, 60, 21),
     strip.Color(255, 94, 0),
@@ -191,12 +249,13 @@ void startupWipe(uint8_t wait) {
     strip.Color(255, 223, 0),
     strip.Color(102, 255, 0),
     strip.Color(0, 255, 142),
-    strip.Color(0, 251, 255)
+    strip.Color(0, 251, 255),
+    colour
   };
   
   for (uint16_t i=0; i < strip.numPixels(); i++) {
-    if (i > 7) {
-      for (uint16_t j = 0; j < 7; j++) {
+    if (i > 8) {
+      for (uint16_t j = 0; j < 8; j++) {
         strip.setPixelColor(i-j, colours[j]);
       }
       strip.show();
